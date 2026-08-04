@@ -974,6 +974,11 @@ impl Tokenizer {
 
         // Fused path: run only Split, then batch-tokenize with inline ByteLevel.
         if let Some(ref split) = self.split_only {
+            let scan_kind = match split {
+                PreTokenizer::Split(inner) => inner.scan_kind(),
+                _ => None,
+            };
+
             // Scanner fast path: for a recognized tiktoken pattern with a single
             // plain-text segment (no added/special tokens matched), skip the
             // regex + `Split` materialization — scan pretoken ranges directly
@@ -981,8 +986,7 @@ impl Tokenizer {
             if pts.splits().len() == 1
                 && pts.splits()[0].token_id.is_none()
                 && pts.buffer().len() <= u32::MAX as usize
-                && let PreTokenizer::Split(inner) = split
-                && let Some(kind) = inner.scan_kind()
+                && let Some(kind) = scan_kind
             {
                 let buffer = pts.buffer();
                 // Fused scan+BPE of a plain-text segment: one pass, split at
@@ -1031,6 +1035,23 @@ impl Tokenizer {
                 }
 
                 let ids = crate::pre_tokenized::tokenize_scanned(buffer, scan_seg)
+                    .map_err(Error::Model)?;
+                return Ok(self.post_process(ids, add_special_tokens));
+            }
+
+            // Added tokens form hard pretoken/BPE boundaries. Preserve the
+            // handwritten scanner across those boundaries: scan every text
+            // span independently and emit pre-assigned token IDs in order.
+            // The whole-input prefix cache remains scoped to the single-text
+            // path above because its key does not include structural splits.
+            if pts.splits().len() > 1
+                && pts.buffer().len() <= u32::MAX as usize
+                && let Some(kind) = scan_kind
+            {
+                let ids = pts
+                    .tokenize_scanned_splits(|segment, out| {
+                        self.model.tokenize_scanned_segment(kind, segment, out)
+                    })
                     .map_err(Error::Model)?;
                 return Ok(self.post_process(ids, add_special_tokens));
             }

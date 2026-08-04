@@ -249,6 +249,85 @@ impl PreTokenizedString {
         }
         Ok(ids)
     }
+
+    /// Tokenize added-token-separated text spans with a fused scanner callback.
+    ///
+    /// With few splits, long text spans retain the scanner's within-span
+    /// newline parallelism. With many splits, chunks of ordered spans run in
+    /// parallel and each worker scans its text spans directly. Added-token
+    /// splits emit their assigned IDs between the corresponding text results.
+    pub(crate) fn tokenize_scanned_splits<F>(&self, tokenize_fn: F) -> Result<Vec<u32>, String>
+    where
+        F: Fn(&str, &mut Vec<u32>) -> Result<(), String> + Sync,
+    {
+        if self.splits.len() < PARALLEL_THRESHOLD {
+            let mut ids = Vec::with_capacity(self.buffer.len() / 3 + self.splits.len());
+            for split in &self.splits {
+                if let Some(id) = split.token_id {
+                    ids.push(id);
+                    continue;
+                }
+                if split.range.is_empty() {
+                    continue;
+                }
+                let text = self.split_text(split);
+                if text.len() < SCAN_FUSED_PARALLEL_MIN {
+                    tokenize_fn(text, &mut ids)?;
+                } else {
+                    let part = tokenize_scanned(text, |segment| {
+                        let mut part = Vec::with_capacity(segment.len() / 3 + 1);
+                        tokenize_fn(segment, &mut part)?;
+                        Ok(part)
+                    })?;
+                    ids.extend(part);
+                }
+            }
+            return Ok(ids);
+        }
+
+        let pool = bpe_pool();
+        let chunk_size = self.splits.len().div_ceil(pool.current_num_threads());
+        pool.install(|| {
+            let chunk_results: Result<Vec<Vec<u32>>, String> = self
+                .splits
+                .par_chunks(chunk_size)
+                .map(|chunk| {
+                    let text_bytes: usize = chunk
+                        .iter()
+                        .filter(|split| split.token_id.is_none())
+                        .map(|split| split.range.len())
+                        .sum();
+                    let mut ids = Vec::with_capacity(text_bytes / 3 + chunk.len());
+                    for split in chunk {
+                        if let Some(id) = split.token_id {
+                            ids.push(id);
+                        } else if !split.range.is_empty() {
+                            let text = self.split_text(split);
+                            if text.len() < SCAN_FUSED_PARALLEL_MIN {
+                                tokenize_fn(text, &mut ids)?;
+                            } else {
+                                let part = tokenize_scanned(text, |segment| {
+                                    let mut part = Vec::with_capacity(segment.len() / 3 + 1);
+                                    tokenize_fn(segment, &mut part)?;
+                                    Ok(part)
+                                })?;
+                                ids.extend(part);
+                            }
+                        }
+                    }
+                    Ok(ids)
+                })
+                .collect();
+
+            let chunks = chunk_results?;
+            let total = chunks.iter().map(Vec::len).sum();
+            let mut ids = Vec::with_capacity(total);
+            for chunk_ids in chunks {
+                ids.extend(chunk_ids);
+            }
+            Ok(ids)
+        })
+    }
 }
 
 /// Minimum buffer size before the fused scan+BPE encode splits across threads.
